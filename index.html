@@ -75,8 +75,7 @@
   .hd-empty{color:#64748b;text-align:center;margin-top:40px;font-size:14px}
   .hd-clear{margin-top:12px;padding:10px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:10px;color:#94a3b8;font-size:13px;cursor:pointer;text-align:center;font-family:inherit}
   .dismiss-btn{margin-top:10px;padding:10px;width:100%;text-align:center;background:#f1f5f9;border:none;border-radius:10px;color:#64748b;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}
-  .debug-info{position:absolute;bottom:40px;left:12px;right:12px;padding:6px 10px;border-radius:8px;background:rgba(0,0,0,0.7);font-size:10px;color:#94a3b8;pointer-events:none;text-align:center;display:none}
-  .debug-info.show{display:block}
+  .debug-info{position:absolute;bottom:40px;left:12px;right:12px;padding:6px 10px;border-radius:8px;background:rgba(0,0,0,0.7);font-size:10px;color:#94a3b8;pointer-events:none;text-align:center}
 </style>
 </head>
 <body>
@@ -97,7 +96,7 @@
   </div>
   <div class="camera-status" id="cam-status"><div class="cs-dot loading"></div><span>準備中...</span></div>
   <div class="camera-hint" id="cam-hint" style="display:none;">バーコードをカメラにかざしてください</div>
-  <div class="debug-info" id="debug-info"></div>
+  <div class="debug-info" id="debug-info">...</div>
   <button class="history-btn" id="history-btn" onclick="openHistory()">📋 履歴</button>
 
   <div class="start-screen" id="start-screen">
@@ -126,9 +125,10 @@
 
 <script src="https://unpkg.com/@zxing/library@latest"></script>
 <script>
-let scanning = false, history = [], scanInterval = null;
+let scanning = false, history = [];
 let lastCode = '', lastTime = 0;
-let reader = null;
+let codeReader = null;
+let currentStream = null;
 
 // ─── GS1 Parser ───
 function parseGS1(raw) {
@@ -177,27 +177,14 @@ let zxReady = false;
 const zxI = setInterval(() => {
   if (typeof ZXing !== 'undefined') {
     clearInterval(zxI);
-    // Set up MultiFormatReader with TRY_HARDER hint
-    reader = new ZXing.MultiFormatReader();
+    codeReader = new ZXing.BrowserMultiFormatReader();
+    // Set TRY_HARDER hints
     const hints = new Map();
     hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-    // Support all 1D formats
-    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
-      ZXing.BarcodeFormat.EAN_13,
-      ZXing.BarcodeFormat.EAN_8,
-      ZXing.BarcodeFormat.UPC_A,
-      ZXing.BarcodeFormat.UPC_E,
-      ZXing.BarcodeFormat.CODE_128,
-      ZXing.BarcodeFormat.CODE_39,
-      ZXing.BarcodeFormat.ITF,
-      ZXing.BarcodeFormat.RSS_14,
-      ZXing.BarcodeFormat.RSS_EXPANDED,
-      ZXing.BarcodeFormat.QR_CODE,
-      ZXing.BarcodeFormat.DATA_MATRIX,
-    ]);
-    reader.setHints(hints);
+    codeReader.hints = hints;
     zxReady = true;
     setStatus('loading', '準備完了');
+    debug('zxing-js loaded');
   }
 }, 100);
 setTimeout(() => { if (!zxReady) { clearInterval(zxI); setStatus('off', '読み込み失敗'); } }, 10000);
@@ -207,11 +194,8 @@ function setStatus(type, text) {
   el.querySelector('.cs-dot').className = 'cs-dot ' + (type === 'live' ? 'live' : type === 'loading' ? 'loading' : 'off');
   el.querySelector('span').textContent = text;
 }
-
-function showDebug(text) {
-  const el = document.getElementById('debug-info');
-  el.textContent = text;
-  el.classList.add('show');
+function debug(text) {
+  document.getElementById('debug-info').textContent = text;
 }
 
 // ─── Camera Start ───
@@ -224,118 +208,72 @@ async function startScan() {
   setStatus('live', 'カメラ起動中...');
 
   try {
-    // ── Step 1: Get camera with high resolution ──
-    // Use min constraints to force higher resolution on Android
-    const stream = await navigator.mediaDevices.getUserMedia({
+    // ── Step 1: Get high-res camera stream manually ──
+    const constraints = {
       audio: false,
       video: {
         facingMode: { ideal: 'environment' },
-        width: { min: 1024, ideal: 1920 },
-        height: { min: 576, ideal: 1080 },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
       }
-    }).catch(() => {
-      // Fallback: if min constraints fail, try without them
-      return navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: {
-          facingMode: { ideal: 'environment' },
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-        }
-      });
+    };
+
+    currentStream = await navigator.mediaDevices.getUserMedia(constraints).catch(() => {
+      // Fallback
+      return navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: 'environment' } });
     });
 
+    // ── Step 2: Attach stream to video manually ──
     const video = document.getElementById('video');
-    video.srcObject = stream;
+    video.srcObject = currentStream;
     video.setAttribute('playsinline', '');
     await video.play();
 
-    // ── Step 2: Enable continuous autofocus ──
-    const track = stream.getVideoTracks()[0];
+    // ── Step 3: Enable autofocus ──
+    const track = currentStream.getVideoTracks()[0];
     try {
       const caps = track.getCapabilities ? track.getCapabilities() : {};
       if (caps.focusMode && caps.focusMode.includes('continuous')) {
         await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
       }
-    } catch (e) { /* not supported on this device */ }
+    } catch (e) { /* not supported */ }
 
-    // Show actual resolution
     const settings = track.getSettings();
     const w = settings.width || video.videoWidth || '?';
     const h = settings.height || video.videoHeight || '?';
-    const focusMode = settings.focusMode || 'default';
-    setStatus('live', 'スキャン中 (' + w + '×' + h + ')');
-    showDebug(w + '×' + h + ' | AF:' + focusMode);
+    const af = settings.focusMode || 'default';
 
+    // ── Step 4: Use BrowserMultiFormatReader.decodeFromStream ──
+    // This method handles canvas internally with proper pixel format
     scanning = true;
 
-    // ── Step 3: Decode loop ──
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-
-    scanInterval = setInterval(() => {
-      if (!scanning || video.readyState < 2) return;
-
-      const vw = video.videoWidth;
-      const vh = video.videoHeight;
-      if (!vw || !vh) return;
-
-      canvas.width = vw;
-      canvas.height = vh;
-      ctx.drawImage(video, 0, 0, vw, vh);
-
-      try {
-        const imageData = ctx.getImageData(0, 0, vw, vh);
-        const rgba = imageData.data; // Uint8ClampedArray, RGBA format
-
-        // Convert RGBA → grayscale luminance (correct conversion)
-        const len = vw * vh;
-        const luminances = new Uint8ClampedArray(len);
-        for (let i = 0; i < len; i++) {
-          const offset = i * 4;
-          // Standard luminance formula: 0.299R + 0.587G + 0.114B
-          luminances[i] = (rgba[offset] * 77 + rgba[offset+1] * 150 + rgba[offset+2] * 29) >> 8;
+    codeReader.decodeFromStream(currentStream, video, (result, err) => {
+      if (result) {
+        const raw = result.getText();
+        const now = Date.now();
+        if (raw !== lastCode || now - lastTime >= 2000) {
+          lastCode = raw;
+          lastTime = now;
+          if (navigator.vibrate) navigator.vibrate(100);
+          handleScan(raw);
         }
-
-        const luminanceSource = new ZXing.RGBLuminanceSource(luminances, vw, vh);
-        const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminanceSource));
-        const result = reader.decode(bitmap);
-
-        if (result) {
-          const raw = result.getText();
-          const now = Date.now();
-          if (raw !== lastCode || now - lastTime >= 2000) {
-            lastCode = raw;
-            lastTime = now;
-            if (navigator.vibrate) navigator.vibrate(100);
-            handleScan(raw);
-          }
-        }
-      } catch (e) {
-        // NotFoundException is expected when no barcode visible — ignore
       }
-    }, 150); // ~6.6 fps
+      // Update debug with stream info on first frame
+      if (scanning) {
+        const vw = video.videoWidth || '?';
+        const vh = video.videoHeight || '?';
+        debug(vw + '×' + vh + ' | AF:' + af + ' | decode:active');
+        setStatus('live', 'スキャン中 (' + vw + '×' + vh + ')');
+      }
+    });
 
   } catch (e) {
+    debug('Error: ' + e.name + ' ' + e.message);
     if (e.name === 'NotAllowedError') {
       setStatus('off', 'カメラが拒否されました');
-      alert('カメラへのアクセスを許可してください。\nブラウザの設定 → サイトの設定 → カメラ から許可できます。');
-    } else if (e.name === 'NotFoundError' || e.name === 'DevicesNotFoundError') {
+      alert('カメラへのアクセスを許可してください。');
+    } else if (e.name === 'NotFoundError') {
       setStatus('off', 'カメラが見つかりません');
-    } else if (e.name === 'OverconstrainedError') {
-      // Resolution constraints too strict — retry with no constraints
-      setStatus('off', '解像度制約エラー、再試行中...');
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: 'environment' } });
-        const video = document.getElementById('video');
-        video.srcObject = stream;
-        await video.play();
-        setStatus('live', 'スキャン中 (制約なし)');
-        scanning = true;
-        startDecodeLoop();
-      } catch (e2) {
-        setStatus('off', 'カメラ起動失敗');
-      }
     } else {
       setStatus('off', 'エラー: ' + e.message);
     }
@@ -344,9 +282,8 @@ async function startScan() {
 
 function stopScan() {
   scanning = false;
-  if (scanInterval) { clearInterval(scanInterval); scanInterval = null; }
-  const video = document.getElementById('video');
-  if (video.srcObject) { video.srcObject.getTracks().forEach(t => t.stop()); video.srcObject = null; }
+  if (codeReader) codeReader.reset();
+  if (currentStream) { currentStream.getTracks().forEach(t => t.stop()); currentStream = null; }
   setStatus('off', '停止中');
 }
 
