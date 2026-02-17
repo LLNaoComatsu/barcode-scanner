@@ -75,6 +75,8 @@
   .hd-empty{color:#64748b;text-align:center;margin-top:40px;font-size:14px}
   .hd-clear{margin-top:12px;padding:10px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:10px;color:#94a3b8;font-size:13px;cursor:pointer;text-align:center;font-family:inherit}
   .dismiss-btn{margin-top:10px;padding:10px;width:100%;text-align:center;background:#f1f5f9;border:none;border-radius:10px;color:#64748b;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}
+  .debug-info{position:absolute;bottom:40px;left:12px;right:12px;padding:6px 10px;border-radius:8px;background:rgba(0,0,0,0.7);font-size:10px;color:#94a3b8;pointer-events:none;text-align:center;display:none}
+  .debug-info.show{display:block}
 </style>
 </head>
 <body>
@@ -95,6 +97,7 @@
   </div>
   <div class="camera-status" id="cam-status"><div class="cs-dot loading"></div><span>準備中...</span></div>
   <div class="camera-hint" id="cam-hint" style="display:none;">バーコードをカメラにかざしてください</div>
+  <div class="debug-info" id="debug-info"></div>
   <button class="history-btn" id="history-btn" onclick="openHistory()">📋 履歴</button>
 
   <div class="start-screen" id="start-screen">
@@ -128,33 +131,87 @@ let lastCode = '', lastTime = 0;
 let reader = null;
 
 // ─── GS1 Parser ───
-function parseGS1(raw){
-  const r={raw,gtin:null,expiryDate:null,lotNumber:null,serialNumber:null};
-  let t=raw.trim();
-  if(t.includes('(')){t=t.replace(/\((\d{2,4})\)/g,'\x1d$1');if(t.startsWith('\x1d'))t=t.substring(1);}
-  t=t.replace(/[\x00]/g,'\x1d');
-  const defs=[{ai:'01',l:'GTIN',len:14,f:true},{ai:'02',l:'C',len:14,f:true},{ai:'10',l:'LOT',f:false},{ai:'11',l:'P',len:6,f:true},{ai:'17',l:'EXP',len:6,f:true},{ai:'21',l:'SER',f:false},{ai:'30',l:'Q',f:false}];
-  for(const part of t.split('\x1d')){let rem=part;while(rem.length>0){let ok=false;for(const d of[...defs].sort((a,b)=>b.ai.length-a.ai.length)){if(rem.startsWith(d.ai)){const vs=d.ai.length;let v;if(d.f&&d.len){v=rem.substring(vs,vs+d.len);rem=rem.substring(vs+d.len);}else{v=rem.substring(vs);rem='';}if(d.l==='GTIN')r.gtin=v;else if(d.l==='EXP'&&v.length===6){const yy=v.substring(0,2),mm=v.substring(2,4),dd=v.substring(4,6),yr=parseInt(yy)>50?'19'+yy:'20'+yy;r.expiryDate={raw:v,formatted:dd==='00'?yr+'年'+mm+'月末日':yr+'年'+mm+'月'+dd+'日'};}else if(d.l==='LOT')r.lotNumber=v;else if(d.l==='SER')r.serialNumber=v;ok=true;break;}}if(!ok)break;}}
+function parseGS1(raw) {
+  const r = { raw, gtin:null, expiryDate:null, lotNumber:null, serialNumber:null };
+  let t = raw.trim();
+  if (t.includes('(')) { t = t.replace(/\((\d{2,4})\)/g, '\x1d$1'); if (t.startsWith('\x1d')) t = t.substring(1); }
+  t = t.replace(/[\x00]/g, '\x1d');
+  const defs = [{ai:'01',l:'GTIN',len:14,f:true},{ai:'02',l:'C',len:14,f:true},{ai:'10',l:'LOT',f:false},{ai:'11',l:'P',len:6,f:true},{ai:'17',l:'EXP',len:6,f:true},{ai:'21',l:'SER',f:false},{ai:'30',l:'Q',f:false}];
+  for (const part of t.split('\x1d')) {
+    let rem = part;
+    while (rem.length > 0) {
+      let ok = false;
+      for (const d of [...defs].sort((a,b) => b.ai.length - a.ai.length)) {
+        if (rem.startsWith(d.ai)) {
+          const vs = d.ai.length; let v;
+          if (d.f && d.len) { v = rem.substring(vs, vs+d.len); rem = rem.substring(vs+d.len); }
+          else { v = rem.substring(vs); rem = ''; }
+          if (d.l==='GTIN') r.gtin = v;
+          else if (d.l==='EXP' && v.length===6) {
+            const yy=v.substring(0,2), mm=v.substring(2,4), dd=v.substring(4,6);
+            const yr = parseInt(yy)>50 ? '19'+yy : '20'+yy;
+            r.expiryDate = { raw:v, formatted: dd==='00' ? yr+'年'+mm+'月末日' : yr+'年'+mm+'月'+dd+'日' };
+          }
+          else if (d.l==='LOT') r.lotNumber = v;
+          else if (d.l==='SER') r.serialNumber = v;
+          ok = true; break;
+        }
+      }
+      if (!ok) break;
+    }
+  }
   return r;
 }
-function detectType(t){if(!t)return'不明';if(t.includes('(01)')||t.match(/^01\d{14}/))return'GS1';const c=t.replace(/[\(\)\x1d]/g,'');if(/^\d{13}$/.test(c))return'JAN-13';if(/^\d{8}$/.test(c))return'JAN-8';return'その他';}
+
+function detectType(t) {
+  if (!t) return '不明';
+  if (t.includes('(01)') || t.match(/^01\d{14}/)) return 'GS1';
+  const c = t.replace(/[\(\)\x1d]/g, '');
+  if (/^\d{13}$/.test(c)) return 'JAN-13';
+  if (/^\d{8}$/.test(c)) return 'JAN-8';
+  return 'その他';
+}
 
 // ─── Wait for ZXing ───
 let zxReady = false;
 const zxI = setInterval(() => {
   if (typeof ZXing !== 'undefined') {
     clearInterval(zxI);
+    // Set up MultiFormatReader with TRY_HARDER hint
     reader = new ZXing.MultiFormatReader();
+    const hints = new Map();
+    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+    // Support all 1D formats
+    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+      ZXing.BarcodeFormat.EAN_13,
+      ZXing.BarcodeFormat.EAN_8,
+      ZXing.BarcodeFormat.UPC_A,
+      ZXing.BarcodeFormat.UPC_E,
+      ZXing.BarcodeFormat.CODE_128,
+      ZXing.BarcodeFormat.CODE_39,
+      ZXing.BarcodeFormat.ITF,
+      ZXing.BarcodeFormat.RSS_14,
+      ZXing.BarcodeFormat.RSS_EXPANDED,
+      ZXing.BarcodeFormat.QR_CODE,
+      ZXing.BarcodeFormat.DATA_MATRIX,
+    ]);
+    reader.setHints(hints);
     zxReady = true;
     setStatus('loading', '準備完了');
   }
 }, 100);
-setTimeout(() => { if (!zxReady) { clearInterval(zxI); setStatus('off', '読み込み失敗'); } }, 8000);
+setTimeout(() => { if (!zxReady) { clearInterval(zxI); setStatus('off', '読み込み失敗'); } }, 10000);
 
 function setStatus(type, text) {
   const el = document.getElementById('cam-status');
   el.querySelector('.cs-dot').className = 'cs-dot ' + (type === 'live' ? 'live' : type === 'loading' ? 'loading' : 'off');
   el.querySelector('span').textContent = text;
+}
+
+function showDebug(text) {
+  const el = document.getElementById('debug-info');
+  el.textContent = text;
+  el.classList.add('show');
 }
 
 // ─── Camera Start ───
@@ -167,60 +224,83 @@ async function startScan() {
   setStatus('live', 'カメラ起動中...');
 
   try {
-    // Step 1: Get high-resolution camera stream with autofocus
+    // ── Step 1: Get camera with high resolution ──
+    // Use min constraints to force higher resolution on Android
     const stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
       video: {
         facingMode: { ideal: 'environment' },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
+        width: { min: 1024, ideal: 1920 },
+        height: { min: 576, ideal: 1080 },
       }
+    }).catch(() => {
+      // Fallback: if min constraints fail, try without them
+      return navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+        }
+      });
     });
 
     const video = document.getElementById('video');
     video.srcObject = stream;
+    video.setAttribute('playsinline', '');
     await video.play();
 
-    // Step 2: Try to enable continuous autofocus
+    // ── Step 2: Enable continuous autofocus ──
     const track = stream.getVideoTracks()[0];
     try {
       const caps = track.getCapabilities ? track.getCapabilities() : {};
       if (caps.focusMode && caps.focusMode.includes('continuous')) {
         await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
       }
-    } catch (e) { /* some devices don't support this */ }
+    } catch (e) { /* not supported on this device */ }
 
-    // Show resolution info
+    // Show actual resolution
     const settings = track.getSettings();
-    const w = settings.width || '?';
-    const h = settings.height || '?';
+    const w = settings.width || video.videoWidth || '?';
+    const h = settings.height || video.videoHeight || '?';
+    const focusMode = settings.focusMode || 'default';
     setStatus('live', 'スキャン中 (' + w + '×' + h + ')');
+    showDebug(w + '×' + h + ' | AF:' + focusMode);
 
     scanning = true;
 
-    // Step 3: Create canvas for frame capture
+    // ── Step 3: Decode loop ──
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-    // Step 4: Decode loop using setInterval + canvas capture
     scanInterval = setInterval(() => {
       if (!scanning || video.readyState < 2) return;
 
-      // Match canvas to video resolution
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      if (!vw || !vh) return;
+
+      canvas.width = vw;
+      canvas.height = vh;
+      ctx.drawImage(video, 0, 0, vw, vh);
 
       try {
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const luminance = new ZXing.RGBLuminanceSource(
-          new Uint8ClampedArray(imageData.data.buffer),
-          canvas.width, canvas.height
-        );
-        const bitmap = new ZXing.BinaryBitmap(
-          new ZXing.HybridBinarizer(luminance)
-        );
+        const imageData = ctx.getImageData(0, 0, vw, vh);
+        const rgba = imageData.data; // Uint8ClampedArray, RGBA format
 
+        // Convert RGBA → grayscale luminance (correct conversion)
+        const len = vw * vh;
+        const luminances = new Uint8ClampedArray(len);
+        for (let i = 0; i < len; i++) {
+          const offset = i * 4;
+          // Standard luminance formula: 0.299R + 0.587G + 0.114B
+          luminances[i] = (rgba[offset] * 77 + rgba[offset+1] * 150 + rgba[offset+2] * 29) >> 8;
+        }
+
+        const luminanceSource = new ZXing.RGBLuminanceSource(luminances, vw, vh);
+        const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminanceSource));
         const result = reader.decode(bitmap);
+
         if (result) {
           const raw = result.getText();
           const now = Date.now();
@@ -232,16 +312,30 @@ async function startScan() {
           }
         }
       } catch (e) {
-        // NotFoundException is expected when no barcode visible
+        // NotFoundException is expected when no barcode visible — ignore
       }
-    }, 200); // scan 5 times per second
+    }, 150); // ~6.6 fps
 
   } catch (e) {
     if (e.name === 'NotAllowedError') {
       setStatus('off', 'カメラが拒否されました');
-      alert('カメラへのアクセスを許可してください。');
-    } else if (e.name === 'NotFoundError') {
+      alert('カメラへのアクセスを許可してください。\nブラウザの設定 → サイトの設定 → カメラ から許可できます。');
+    } else if (e.name === 'NotFoundError' || e.name === 'DevicesNotFoundError') {
       setStatus('off', 'カメラが見つかりません');
+    } else if (e.name === 'OverconstrainedError') {
+      // Resolution constraints too strict — retry with no constraints
+      setStatus('off', '解像度制約エラー、再試行中...');
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: 'environment' } });
+        const video = document.getElementById('video');
+        video.srcObject = stream;
+        await video.play();
+        setStatus('live', 'スキャン中 (制約なし)');
+        scanning = true;
+        startDecodeLoop();
+      } catch (e2) {
+        setStatus('off', 'カメラ起動失敗');
+      }
     } else {
       setStatus('off', 'エラー: ' + e.message);
     }
@@ -271,7 +365,10 @@ function handleScan(raw) {
 function showResult(r) {
   const content = document.getElementById('result-content');
   let f = '';
-  const add = (l, v, h) => { const c = v ? (h ? 'field-value highlight' : 'field-value') : 'field-value empty'; f += `<div class="field"><div class="field-label">${l}</div><div class="${c}">${v || 'なし'}</div></div>`; };
+  const add = (l, v, h) => {
+    const c = v ? (h ? 'field-value highlight' : 'field-value') : 'field-value empty';
+    f += `<div class="field"><div class="field-label">${l}</div><div class="${c}">${v || 'なし'}</div></div>`;
+  };
   add('商品コード (GTIN)', r.gtin, false);
   add('有効期限', r.expiryDate?.formatted, true);
   add('ロット番号', r.lotNumber, false);
@@ -280,9 +377,9 @@ function showResult(r) {
   let tok = '';
   const m = r.raw.match(/\(\d{2,4}\)[^\(]*/g);
   if (m) {
-    const cs = { '01': { bg: '#dbeafe', bd: '#3b82f6', tx: '#1e40af' }, '17': { bg: '#dcfce7', bd: '#22c55e', tx: '#166534' }, '10': { bg: '#fef3c7', bd: '#f59e0b', tx: '#92400e' }, '21': { bg: '#f3e8ff', bd: '#a855f7', tx: '#6b21a8' } };
+    const cs = { '01':{bg:'#dbeafe',bd:'#3b82f6',tx:'#1e40af'}, '17':{bg:'#dcfce7',bd:'#22c55e',tx:'#166534'}, '10':{bg:'#fef3c7',bd:'#f59e0b',tx:'#92400e'}, '21':{bg:'#f3e8ff',bd:'#a855f7',tx:'#6b21a8'} };
     tok = '<div class="tokens">';
-    m.forEach(s => { const x = s.match(/\((\d{2,4})\)(.*)/); if (!x) return; const c = cs[x[1]] || { bg: '#f1f5f9', bd: '#94a3b8', tx: '#475569' }; tok += `<div class="tok" style="background:${c.bg};border-color:${c.bd}"><span class="tok-ai" style="color:${c.tx}">AI(${x[1]})</span><span class="tok-val" style="color:${c.tx}">${x[2]}</span></div>`; });
+    m.forEach(s => { const x = s.match(/\((\d{2,4})\)(.*)/); if (!x) return; const c = cs[x[1]] || {bg:'#f1f5f9',bd:'#94a3b8',tx:'#475569'}; tok += `<div class="tok" style="background:${c.bg};border-color:${c.bd}"><span class="tok-ai" style="color:${c.tx}">AI(${x[1]})</span><span class="tok-val" style="color:${c.tx}">${x[2]}</span></div>`; });
     tok += '</div>';
   }
 
@@ -297,7 +394,10 @@ function dismissResult() { document.getElementById('result-panel').classList.rem
 function openHistory() {
   const d = document.getElementById('history-drawer'), l = document.getElementById('hd-list'), c = document.getElementById('hd-clear');
   if (history.length === 0) { l.innerHTML = '<div class="hd-empty">まだスキャン履歴がありません</div>'; c.style.display = 'none'; }
-  else { l.innerHTML = history.map((h, i) => `<div class="hd-item" onclick="showHI(${i})"><div class="hd-time">${h.timestamp.toLocaleTimeString('ja-JP')} — ${h.barcodeType}</div><div class="hd-code">${h.raw}</div><div class="hd-info">${h.gtin ? 'GTIN:' + h.gtin : ''} ${h.expiryDate ? '期限:' + h.expiryDate.formatted : ''} ${h.lotNumber ? 'ロット:' + h.lotNumber : ''}</div></div>`).join(''); c.style.display = 'block'; }
+  else {
+    l.innerHTML = history.map((h, i) => `<div class="hd-item" onclick="showHI(${i})"><div class="hd-time">${h.timestamp.toLocaleTimeString('ja-JP')} — ${h.barcodeType}</div><div class="hd-code">${h.raw}</div><div class="hd-info">${h.gtin ? 'GTIN:'+h.gtin : ''} ${h.expiryDate ? '期限:'+h.expiryDate.formatted : ''} ${h.lotNumber ? 'ロット:'+h.lotNumber : ''}</div></div>`).join('');
+    c.style.display = 'block';
+  }
   d.classList.add('open');
 }
 function closeHistory() { document.getElementById('history-drawer').classList.remove('open'); }
