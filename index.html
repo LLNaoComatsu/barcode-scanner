@@ -16,14 +16,7 @@
   .header .sub{font-size:10px;color:rgba(255,255,255,0.6)}
   .scan-count{margin-left:auto;padding:4px 10px;background:rgba(255,255,255,0.15);border-radius:12px;font-size:11px;font-weight:600}
   .camera-section{flex:1;position:relative;overflow:hidden;background:#000;min-height:0}
-  /* Key fix: video is sized larger than viewport, clipped by overflow:hidden */
-  #video{
-    position:absolute;
-    top:50%;left:50%;
-    transform:translate(-50%,-50%);
-    min-width:100%;min-height:100%;
-    /* width/height attributes will be set via JS to match actual camera resolution */
-  }
+  #video{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);min-width:100%;min-height:100%}
   .scan-overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
   .scan-frame{width:75%;max-width:320px;aspect-ratio:3/2;position:relative}
   .sf-corner{position:absolute;width:24px;height:24px}
@@ -82,7 +75,7 @@
   .hd-empty{color:#64748b;text-align:center;margin-top:40px;font-size:14px}
   .hd-clear{margin-top:12px;padding:10px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:10px;color:#94a3b8;font-size:13px;cursor:pointer;text-align:center;font-family:inherit}
   .dismiss-btn{margin-top:10px;padding:10px;width:100%;text-align:center;background:#f1f5f9;border:none;border-radius:10px;color:#64748b;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}
-  .debug-info{position:absolute;bottom:40px;left:12px;right:12px;padding:6px 10px;border-radius:8px;background:rgba(0,0,0,0.7);font-size:10px;color:#94a3b8;pointer-events:none;text-align:center}
+  .debug-info{position:absolute;bottom:40px;left:12px;right:12px;padding:6px 10px;border-radius:8px;background:rgba(0,0,0,0.7);font-size:9px;color:#94a3b8;pointer-events:none;text-align:center;line-height:1.5}
 </style>
 </head>
 <body>
@@ -134,10 +127,8 @@
 <script>
 let scanning = false, historyList = [];
 let lastCode = '', lastTime = 0;
-let codeReader = null;
-let currentStream = null;
+let codeReader = null, currentStream = null;
 
-// ─── GS1 Parser ───
 function parseGS1(raw) {
   const r = { raw, gtin:null, expiryDate:null, lotNumber:null, serialNumber:null };
   let t = raw.trim();
@@ -178,7 +169,6 @@ function detectType(t) {
   return 'その他';
 }
 
-// ─── Wait for ZXing ───
 let zxReady = false;
 const zxI = setInterval(() => {
   if (typeof ZXing !== 'undefined') {
@@ -189,7 +179,6 @@ const zxI = setInterval(() => {
     codeReader.hints = hints;
     zxReady = true;
     setStatus('loading', '準備完了');
-    dbg('zxing-js loaded');
   }
 }, 100);
 setTimeout(() => { if (!zxReady) { clearInterval(zxI); setStatus('off', '読み込み失敗'); } }, 10000);
@@ -201,7 +190,6 @@ function setStatus(type, text) {
 }
 function dbg(text) { document.getElementById('debug-info').textContent = text; }
 
-// ─── Camera Start ───
 async function startScan() {
   if (!zxReady) { alert('ライブラリ読み込み中です。'); return; }
 
@@ -211,25 +199,45 @@ async function startScan() {
   setStatus('live', 'カメラ起動中...');
 
   try {
-    // Step 1: Get high-res stream
-    currentStream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        facingMode: { ideal: 'environment' },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
+    // ── Attempt 1: Request with focusMode in initial constraints ──
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: { exact: 'environment' },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          focusMode: { ideal: 'continuous' },
+        }
+      });
+    } catch (e1) {
+      // ── Attempt 2: Without focusMode, without exact facingMode ──
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+          }
+        });
+      } catch (e2) {
+        // ── Attempt 3: Minimal ──
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: 'environment' }
+        });
       }
-    }).catch(() =>
-      navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: 'environment' } })
-    );
+    }
 
-    // Step 2: Set video element attributes to match actual resolution
+    currentStream = stream;
     const video = document.getElementById('video');
-    video.srcObject = currentStream;
+    video.srcObject = stream;
     video.setAttribute('playsinline', '');
     await video.play();
 
-    // Wait for video dimensions to be available
+    // Wait for video to be ready
     await new Promise(resolve => {
       const check = () => {
         if (video.videoWidth > 0 && video.videoHeight > 0) resolve();
@@ -238,29 +246,76 @@ async function startScan() {
       check();
     });
 
-    // KEY FIX: Set the video element's width/height attributes
-    // to the actual camera resolution. This forces zxing-js internal
-    // canvas to use the full resolution instead of CSS display size.
     video.width = video.videoWidth;
     video.height = video.videoHeight;
 
-    // Step 3: Autofocus
-    const track = currentStream.getVideoTracks()[0];
-    let af = 'default';
+    // ── Aggressively try to enable autofocus via applyConstraints ──
+    const track = stream.getVideoTracks()[0];
+    let afStatus = 'unknown';
+    let capsInfo = '';
+
     try {
       const caps = track.getCapabilities ? track.getCapabilities() : {};
-      if (caps.focusMode && caps.focusMode.includes('continuous')) {
-        await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
-        af = 'continuous';
-      }
-    } catch (e) {}
+      const focusModes = caps.focusMode || [];
+      const hasContinuous = focusModes.includes('continuous');
+      const hasSingleShot = focusModes.includes('single-shot');
+      const focusDistRange = caps.focusDistance || null;
+      capsInfo = 'modes:[' + focusModes.join(',') + ']';
+      if (focusDistRange) capsInfo += ' dist:' + focusDistRange.min + '-' + focusDistRange.max;
 
+      // Try continuous first
+      if (hasContinuous) {
+        try {
+          await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+          afStatus = 'continuous';
+        } catch (e) {
+          afStatus = 'continuous-failed';
+        }
+      }
+
+      // If continuous didn't work, try single-shot (tap-to-focus equivalent)
+      if (afStatus !== 'continuous' && hasSingleShot) {
+        try {
+          await track.applyConstraints({ advanced: [{ focusMode: 'single-shot' }] });
+          afStatus = 'single-shot';
+          // Re-trigger single-shot periodically
+          setInterval(async () => {
+            if (!scanning) return;
+            try { await track.applyConstraints({ advanced: [{ focusMode: 'single-shot' }] }); }
+            catch(e) {}
+          }, 3000);
+        } catch (e) {
+          afStatus = 'single-shot-failed';
+        }
+      }
+
+      // If neither worked but we have focusDistance, set to near range
+      if (afStatus.includes('failed') || afStatus === 'unknown') {
+        if (focusDistRange) {
+          try {
+            // Set focus to near range (good for barcode scanning ~15-30cm)
+            const nearFocus = focusDistRange.min + (focusDistRange.max - focusDistRange.min) * 0.15;
+            await track.applyConstraints({ advanced: [{ focusDistance: nearFocus }] });
+            afStatus = 'manual(' + nearFocus.toFixed(2) + ')';
+          } catch (e) {
+            afStatus = 'manual-failed';
+          }
+        }
+      }
+    } catch (e) {
+      afStatus = 'caps-error';
+    }
+
+    // Read final settings
+    const settings = track.getSettings();
+    const finalAF = settings.focusMode || afStatus;
     const vw = video.videoWidth;
     const vh = video.videoHeight;
-    dbg('video:' + vw + '×' + vh + ' attr:' + video.width + '×' + video.height + ' AF:' + af);
+
+    dbg(vw + '×' + vh + ' | AF:' + finalAF + ' | ' + capsInfo);
     setStatus('live', 'スキャン中 (' + vw + '×' + vh + ')');
 
-    // Step 4: Decode from stream
+    // ── Start decode ──
     scanning = true;
     codeReader.decodeFromStream(currentStream, video, (result, err) => {
       if (result) {
@@ -293,7 +348,6 @@ function stopScan() {
   setStatus('off', '停止中');
 }
 
-// ─── Handle Scan ───
 function handleScan(raw) {
   const parsed = parseGS1(raw), type = detectType(raw);
   const entry = { ...parsed, barcodeType: type, timestamp: new Date() };
@@ -304,7 +358,6 @@ function handleScan(raw) {
   showResult(entry);
 }
 
-// ─── Result Display ───
 function showResult(r) {
   const content = document.getElementById('result-content');
   let f = '';
@@ -316,7 +369,6 @@ function showResult(r) {
   add('有効期限', r.expiryDate?.formatted, true);
   add('ロット番号', r.lotNumber, false);
   if (r.serialNumber) add('シリアル番号', r.serialNumber, false);
-
   let tok = '';
   const m = r.raw.match(/\(\d{2,4}\)[^\(]*/g);
   if (m) {
@@ -325,14 +377,12 @@ function showResult(r) {
     m.forEach(s => { const x = s.match(/\((\d{2,4})\)(.*)/); if (!x) return; const c = cs[x[1]] || {bg:'#f1f5f9',bd:'#94a3b8',tx:'#475569'}; tok += `<div class="tok" style="background:${c.bg};border-color:${c.bd}"><span class="tok-ai" style="color:${c.tx}">AI(${x[1]})</span><span class="tok-val" style="color:${c.tx}">${x[2]}</span></div>`; });
     tok += '</div>';
   }
-
   const escaped = r.raw.replace(/'/g, "\\'");
   content.innerHTML = `<div class="result-header"><div class="result-dot"></div><span class="result-title">検出</span><span class="result-type">${r.barcodeType}</span></div><div class="fields">${f}</div><div class="raw-row"><code>${r.raw}</code><button onclick="navigator.clipboard?.writeText('${escaped}')">コピー</button></div>${tok}`;
   document.getElementById('result-panel').classList.add('show');
 }
 function dismissResult() { document.getElementById('result-panel').classList.remove('show'); }
 
-// ─── History ───
 function openHistory() {
   const d = document.getElementById('history-drawer'), l = document.getElementById('hd-list'), c = document.getElementById('hd-clear');
   if (historyList.length === 0) { l.innerHTML = '<div class="hd-empty">まだスキャン履歴がありません</div>'; c.style.display = 'none'; }
