@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#064e3b">
+<title>バーコードスキャナー</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Hiragino Sans', 'Noto Sans JP', sans-serif;
+    background: #0f172a; color: #fff;
+    display: flex; flex-direction: column;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none; -webkit-user-select: none;
+  }
+  .header {
+    background: linear-gradient(135deg, #064e3b, #0f766e);
+    padding: 12px 16px; padding-top: max(12px, env(safe-area-inset-top));
+    display: flex; align-items: center; gap: 10; flex-shrink: 0; z-index: 10;
+  }
+  .header h1 { font-size: 16px; font-weight: 700; }
+  .header .sub { font-size: 10px; color: rgba(255,255,255,0.6); }
+  .scan-count {
+    margin-left: auto; padding: 4px 10px;
+    background: rgba(255,255,255,0.15); border-radius: 12px;
+    font-size: 11px; font-weight: 600;
+  }
+  .camera-section { flex: 1; position: relative; overflow: hidden; background: #000; min-height: 0; }
+  #video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .scan-overlay {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; pointer-events: none;
+  }
+  .scan-frame { width: 75%; max-width: 320px; aspect-ratio: 3/2; position: relative; }
+  .sf-corner { position: absolute; width: 24px; height: 24px; }
+  .sf-tl { top:0;left:0; border-top:3px solid #34d399; border-left:3px solid #34d399; border-radius:6px 0 0 0; }
+  .sf-tr { top:0;right:0; border-top:3px solid #34d399; border-right:3px solid #34d399; border-radius:0 6px 0 0; }
+  .sf-bl { bottom:0;left:0; border-bottom:3px solid #34d399; border-left:3px solid #34d399; border-radius:0 0 0 6px; }
+  .sf-br { bottom:0;right:0; border-bottom:3px solid #34d399; border-right:3px solid #34d399; border-radius:0 0 6px 0; }
+  .scan-line {
+    position: absolute; left: 8%; width: 84%; height: 2px;
+    background: linear-gradient(90deg, transparent, #34d399, transparent);
+    box-shadow: 0 0 16px #34d399; animation: scanAnim 2s ease-in-out infinite;
+  }
+  @keyframes scanAnim { 0%,100%{ top:10%; } 50%{ top:85%; } }
+  .camera-hint {
+    position: absolute; bottom: 16px; left: 0; right: 0;
+    text-align: center; font-size: 13px; color: rgba(255,255,255,0.7);
+    text-shadow: 0 1px 4px rgba(0,0,0,0.8); pointer-events: none;
+  }
+  .camera-status {
+    position: absolute; top: 12px; left: 12px;
+    padding: 4px 10px; border-radius: 8px;
+    background: rgba(0,0,0,0.6); backdrop-filter: blur(4px);
+    font-size: 11px; color: rgba(255,255,255,0.8);
+    display: flex; align-items: center; gap: 6; pointer-events: none;
+  }
+  .cs-dot { width: 6px; height: 6px; border-radius: 50%; }
+  .cs-dot.live { background: #34d399; box-shadow: 0 0 6px #34d399; animation: blink 1.5s infinite; }
+  .cs-dot.off { background: #94a3b8; }
+  .cs-dot.loading { background: #fbbf24; animation: blink 0.6s infinite; }
+  @keyframes blink { 0%,100%{ opacity:1; } 50%{ opacity:0.3; } }
+  .start-screen {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 16px;
+    background: #0f172a; z-index: 5;
+  }
+  .start-screen svg { opacity: 0.4; }
+  .start-screen p { color: #94a3b8; font-size: 14px; text-align: center; padding: 0 32px; line-height: 1.6; }
+  .start-btn {
+    padding: 14px 40px; border: none; border-radius: 14px;
+    background: linear-gradient(135deg, #0f766e, #064e3b);
+    color: #fff; font-size: 16px; font-weight: 700; cursor: pointer;
+    box-shadow: 0 4px 20px rgba(15,118,110,0.4); font-family: inherit;
+  }
+  .start-btn:active { transform: scale(0.97); }
+  .start-screen.hidden { display: none; }
+  .result-panel {
+    flex-shrink: 0; background: #fff; color: #0f172a;
+    border-radius: 20px 20px 0 0;
+    padding: 16px 16px; padding-bottom: max(16px, env(safe-area-inset-bottom));
+    box-shadow: 0 -4px 24px rgba(0,0,0,0.3);
+    max-height: 55vh; overflow-y: auto;
+    transform: translateY(100%);
+    transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1); z-index: 20;
+  }
+  .result-panel.show { transform: translateY(0); }
+  .panel-handle { width: 36px; height: 4px; background: #cbd5e1; border-radius: 2px; margin: 0 auto 12px; }
+  .result-header { display: flex; align-items: center; gap: 8; margin-bottom: 12px; }
+  .result-dot { width: 10px; height: 10px; border-radius: 50%; background: #0f766e; flex-shrink: 0; }
+  .result-type {
+    padding: 3px 8px; background: #ccfbf1; color: #064e3b;
+    border-radius: 12px; font-size: 10px; font-weight: 700; margin-left: auto;
+  }
+  .result-title { font-size: 14px; font-weight: 700; }
+  .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .field { padding: 10px 12px; background: #f8fafc; border-radius: 10px; }
+  .field-label { font-size: 10px; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 3px; }
+  .field-value { font-size: 15px; font-weight: 600; color: #0f172a; font-family: 'SF Mono','Menlo',monospace; word-break: break-all; }
+  .field-value.highlight { color: #0f766e; }
+  .field-value.empty { color: #cbd5e1; font-style: italic; font-family: inherit; }
+  .raw-row {
+    margin-top: 10px; padding: 8px 12px; background: #0f172a;
+    border-radius: 8px; display: flex; align-items: center; gap: 8;
+  }
+  .raw-row code { flex: 1; font-size: 11px; color: #86efac; font-family: 'SF Mono','Menlo',monospace; word-break: break-all; }
+  .raw-row button {
+    padding: 4px 10px; background: rgba(255,255,255,0.1); color: #94a3b8;
+    border: 1px solid rgba(255,255,255,0.15); border-radius: 6px;
+    font-size: 10px; cursor: pointer; font-family: inherit; flex-shrink: 0;
+  }
+  .tokens { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .tok { padding: 4px 10px; border-radius: 6px; border: 1.5px solid; display: flex; flex-direction: column; gap: 1px; }
+  .tok-ai { font-size: 9px; font-weight: 700; }
+  .tok-val { font-size: 13px; font-family: 'SF Mono',monospace; font-weight: 600; }
+  .history-btn {
+    position: absolute; top: 12px; right: 12px;
+    padding: 6px 12px; background: rgba(0,0,0,0.6);
+    backdrop-filter: blur(4px); border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 8px; color: #fff; font-size: 11px; font-weight: 600;
+    cursor: pointer; font-family: inherit; z-index: 8; display: none;
+  }
+  .history-btn.show { display: block; }
+  .history-drawer {
+    position: absolute; inset: 0; background: rgba(0,0,0,0.85);
+    backdrop-filter: blur(8px); z-index: 30; display: none;
+    flex-direction: column; padding: 16px;
+    padding-top: max(16px, env(safe-area-inset-top));
+  }
+  .history-drawer.open { display: flex; }
+  .hd-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .hd-header h2 { font-size: 16px; font-weight: 700; }
+  .hd-close {
+    padding: 6px 14px; background: rgba(255,255,255,0.1);
+    border: 1px solid rgba(255,255,255,0.2); border-radius: 8px;
+    color: #fff; font-size: 13px; cursor: pointer; font-family: inherit;
+  }
+  .hd-list { flex: 1; overflow-y: auto; }
+  .hd-item { padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.1); cursor: pointer; }
+  .hd-item:active { background: rgba(255,255,255,0.05); }
+  .hd-time { font-size: 10px; color: #94a3b8; }
+  .hd-code { font-size: 13px; font-family: monospace; color: #34d399; margin: 2px 0; }
+  .hd-info { font-size: 11px; color: #cbd5e1; }
+  .hd-empty { color: #64748b; text-align: center; margin-top: 40px; font-size: 14px; }
+  .hd-clear {
+    margin-top: 12px; padding: 10px; background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 10px;
+    color: #94a3b8; font-size: 13px; cursor: pointer; text-align: center; font-family: inherit;
+  }
+  .dismiss-btn {
+    margin-top: 10px; padding: 10px; width: 100%; text-align: center;
+    background: #f1f5f9; border: none; border-radius: 10px;
+    color: #64748b; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>バーコードスキャナー</h1>
+    <div class="sub">Hanasto デモ — スマホ版</div>
+  </div>
+  <div class="scan-count" id="scan-count">0件</div>
+</div>
+
+<div class="camera-section">
+  <video id="video" playsinline muted></video>
+  <div class="scan-overlay" id="scan-overlay" style="display:none;">
+    <div class="scan-frame">
+      <div class="sf-corner sf-tl"></div>
+      <div class="sf-corner sf-tr"></div>
+      <div class="sf-corner sf-bl"></div>
+      <div class="sf-corner sf-br"></div>
+      <div class="scan-line"></div>
+    </div>
+  </div>
+  <div class="camera-status" id="cam-status"><div class="cs-dot loading"></div><span>準備中...</span></div>
+  <div class="camera-hint" id="cam-hint" style="display:none;">バーコードをカメラにかざしてください</div>
+  <button class="history-btn" id="history-btn" onclick="openHistory()">📋 履歴</button>
+  <div class="start-screen" id="start-screen">
+    <svg width="72" height="72" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.5">
+      <path d="M1 4V1h3M20 1h3v3M1 20v3h3M20 23h3v-3"/>
+      <rect x="5" y="5" width="14" height="14" rx="1"/>
+      <line x1="5" y1="9" x2="19" y2="9"/>
+      <line x1="5" y1="13" x2="19" y2="13"/>
+    </svg>
+    <p>カメラでバーコードを<br>リアルタイムにスキャンします</p>
+    <button class="start-btn" onclick="startScan()">スキャン開始</button>
+    <p style="font-size:11px;color:#64748b;">zxing-js使用 — JAN / EAN / GS1 対応</p>
+  </div>
+  <div class="history-drawer" id="history-drawer">
+    <div class="hd-header"><h2>📋 スキャン履歴</h2><button class="hd-close" onclick="closeHistory()">閉じる</button></div>
+    <div class="hd-list" id="hd-list"></div>
+    <button class="hd-clear" id="hd-clear" onclick="clearHistory()" style="display:none;">履歴をクリア</button>
+  </div>
+</div>
+
+<div class="result-panel" id="result-panel">
+  <div class="panel-handle"></div>
+  <div id="result-content"></div>
+  <button class="dismiss-btn" onclick="dismissResult()">閉じる（スキャン続行）</button>
+</div>
+
+<script src="https://unpkg.com/@zxing/library@latest"></script>
+<script>
+let codeReader = null, scanning = false, history = [];
+let lastCode = '', lastTime = 0;
+
+function parseGS1(raw) {
+  const r = { raw, gtin:null, expiryDate:null, lotNumber:null, serialNumber:null };
+  let t = raw.trim();
+  if (t.includes('(')) { t = t.replace(/\((\d{2,4})\)/g, '\x1d$1'); if (t.startsWith('\x1d')) t = t.substring(1); }
+  t = t.replace(/[\x00]/g, '\x1d');
+  const defs = [
+    {ai:'01',l:'GTIN',len:14,f:true},{ai:'02',l:'C',len:14,f:true},
+    {ai:'10',l:'LOT',f:false},{ai:'11',l:'P',len:6,f:true},
+    {ai:'17',l:'EXP',len:6,f:true},{ai:'21',l:'SER',f:false},{ai:'30',l:'Q',f:false},
+  ];
+  for (const part of t.split('\x1d')) {
+    let rem = part;
+    while (rem.length > 0) {
+      let ok = false;
+      for (const d of [...defs].sort((a,b)=>b.ai.length-a.ai.length)) {
+        if (rem.startsWith(d.ai)) {
+          const vs = d.ai.length; let v;
+          if (d.f&&d.len){v=rem.substring(vs,vs+d.len);rem=rem.substring(vs+d.len);}
+          else{v=rem.substring(vs);rem='';}
+          if(d.l==='GTIN')r.gtin=v;
+          else if(d.l==='EXP'&&v.length===6){
+            const yy=v.substring(0,2),mm=v.substring(2,4),dd=v.substring(4,6);
+            const yr=parseInt(yy)>50?'19'+yy:'20'+yy;
+            r.expiryDate={raw:v,formatted:dd==='00'?yr+'年'+mm+'月末日':yr+'年'+mm+'月'+dd+'日'};
+          }
+          else if(d.l==='LOT')r.lotNumber=v;
+          else if(d.l==='SER')r.serialNumber=v;
+          ok=true;break;
+        }
+      }
+      if(!ok)break;
+    }
+  }
+  return r;
+}
+
+function detectType(t) {
+  if(!t)return'不明';
+  if(t.includes('(01)')||t.match(/^01\d{14}/))return'GS1';
+  const c=t.replace(/[\(\)\x1d]/g,'');
+  if(/^\d{13}$/.test(c))return'JAN-13';
+  if(/^\d{8}$/.test(c))return'JAN-8';
+  return'その他';
+}
+
+let zxReady=false;
+const zxI=setInterval(()=>{
+  if(typeof ZXing!=='undefined'){
+    clearInterval(zxI);
+    codeReader=new ZXing.BrowserMultiFormatReader();
+    zxReady=true;
+    setStatus('loading','準備完了');
+  }
+},100);
+setTimeout(()=>{if(!zxReady){clearInterval(zxI);setStatus('off','読み込み失敗');}},8000);
+
+function setStatus(type,text){
+  const el=document.getElementById('cam-status');
+  el.querySelector('.cs-dot').className='cs-dot '+(type==='live'?'live':type==='loading'?'loading':'off');
+  el.querySelector('span').textContent=text;
+}
+
+async function startScan(){
+  if(!zxReady){alert('ライブラリ読み込み中です。少々お待ちください。');return;}
+  document.getElementById('start-screen').classList.add('hidden');
+  document.getElementById('scan-overlay').style.display='flex';
+  document.getElementById('cam-hint').style.display='block';
+  setStatus('live','スキャン中...');
+  scanning=true;
+  try{
+    codeReader.decodeFromVideoDevice(undefined,document.getElementById('video'),(result,err)=>{
+      if(result){
+        const raw=result.getText(),now=Date.now();
+        if(raw===lastCode&&now-lastTime<2000)return;
+        lastCode=raw;lastTime=now;
+        if(navigator.vibrate)navigator.vibrate(100);
+        handleScan(raw);
+      }
+    });
+  }catch(e){setStatus('off','カメラエラー: '+e.message);}
+}
+
+function handleScan(raw){
+  const parsed=parseGS1(raw),type=detectType(raw);
+  const entry={...parsed,barcodeType:type,timestamp:new Date()};
+  if(history.length>0&&history[0].raw===raw)return;
+  history.unshift(entry);if(history.length>50)history.pop();
+  document.getElementById('scan-count').textContent=history.length+'件';
+  document.getElementById('history-btn').classList.add('show');
+  showResult(entry);
+}
+
+function showResult(r){
+  const content=document.getElementById('result-content');
+  let f='';
+  const add=(l,v,h)=>{const c=v?(h?'field-value highlight':'field-value'):'field-value empty';f+=`<div class="field"><div class="field-label">${l}</div><div class="${c}">${v||'なし'}</div></div>`;};
+  add('商品コード (GTIN)',r.gtin,false);
+  add('有効期限',r.expiryDate?.formatted,true);
+  add('ロット番号',r.lotNumber,false);
+  if(r.serialNumber)add('シリアル番号',r.serialNumber,false);
+
+  let tok='';
+  const m=r.raw.match(/\(\d{2,4}\)[^\(]*/g);
+  if(m){
+    const cs={'01':{bg:'#dbeafe',bd:'#3b82f6',tx:'#1e40af'},'17':{bg:'#dcfce7',bd:'#22c55e',tx:'#166534'},'10':{bg:'#fef3c7',bd:'#f59e0b',tx:'#92400e'},'21':{bg:'#f3e8ff',bd:'#a855f7',tx:'#6b21a8'}};
+    tok='<div class="tokens">';
+    m.forEach(s=>{const x=s.match(/\((\d{2,4})\)(.*)/);if(!x)return;const c=cs[x[1]]||{bg:'#f1f5f9',bd:'#94a3b8',tx:'#475569'};tok+=`<div class="tok" style="background:${c.bg};border-color:${c.bd}"><span class="tok-ai" style="color:${c.tx}">AI(${x[1]})</span><span class="tok-val" style="color:${c.tx}">${x[2]}</span></div>`;});
+    tok+='</div>';
+  }
+
+  content.innerHTML=`<div class="result-header"><div class="result-dot"></div><span class="result-title">検出</span><span class="result-type">${r.barcodeType}</span></div><div class="fields">${f}</div><div class="raw-row"><code>${r.raw}</code><button onclick="navigator.clipboard?.writeText('${r.raw}')">コピー</button></div>${tok}`;
+  document.getElementById('result-panel').classList.add('show');
+}
+
+function dismissResult(){document.getElementById('result-panel').classList.remove('show');}
+
+function openHistory(){
+  const d=document.getElementById('history-drawer'),l=document.getElementById('hd-list'),c=document.getElementById('hd-clear');
+  if(history.length===0){l.innerHTML='<div class="hd-empty">まだスキャン履歴がありません</div>';c.style.display='none';}
+  else{
+    l.innerHTML=history.map((h,i)=>`<div class="hd-item" onclick="showHI(${i})"><div class="hd-time">${h.timestamp.toLocaleTimeString('ja-JP')} — ${h.barcodeType}</div><div class="hd-code">${h.raw}</div><div class="hd-info">${h.gtin?'GTIN:'+h.gtin:''} ${h.expiryDate?'期限:'+h.expiryDate.formatted:''} ${h.lotNumber?'ロット:'+h.lotNumber:''}</div></div>`).join('');
+    c.style.display='block';
+  }
+  d.classList.add('open');
+}
+function closeHistory(){document.getElementById('history-drawer').classList.remove('open');}
+function showHI(i){closeHistory();showResult(history[i]);}
+function clearHistory(){history=[];document.getElementById('scan-count').textContent='0件';document.getElementById('history-btn').classList.remove('show');closeHistory();dismissResult();}
+</script>
+</body>
+</html>
