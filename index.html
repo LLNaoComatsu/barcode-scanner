@@ -33,11 +33,6 @@
   .cs-dot.off{background:#94a3b8}
   .cs-dot.loading{background:#fbbf24;animation:blink .6s infinite}
   @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
-
-  /* Resolution indicator */
-  .res-info{position:absolute;top:12px;right:80px;padding:4px 8px;border-radius:6px;background:rgba(0,0,0,0.5);font-size:10px;color:rgba(255,255,255,0.6);pointer-events:none;display:none}
-  .res-info.show{display:block}
-
   .start-screen{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;background:#0f172a;z-index:5}
   .start-screen svg{opacity:.4}
   .start-screen p{color:#94a3b8;font-size:14px;text-align:center;padding:0 32px;line-height:1.6}
@@ -99,7 +94,6 @@
     </div>
   </div>
   <div class="camera-status" id="cam-status"><div class="cs-dot loading"></div><span>準備中...</span></div>
-  <div class="res-info" id="res-info"></div>
   <div class="camera-hint" id="cam-hint" style="display:none;">バーコードをカメラにかざしてください</div>
   <button class="history-btn" id="history-btn" onclick="openHistory()">📋 履歴</button>
 
@@ -129,9 +123,11 @@
 
 <script src="https://unpkg.com/@zxing/library@latest"></script>
 <script>
-let codeReader=null,scanning=false,history=[];
-let lastCode='',lastTime=0;
+let scanning = false, history = [], scanInterval = null;
+let lastCode = '', lastTime = 0;
+let reader = null;
 
+// ─── GS1 Parser ───
 function parseGS1(raw){
   const r={raw,gtin:null,expiryDate:null,lotNumber:null,serialNumber:null};
   let t=raw.trim();
@@ -143,32 +139,40 @@ function parseGS1(raw){
 }
 function detectType(t){if(!t)return'不明';if(t.includes('(01)')||t.match(/^01\d{14}/))return'GS1';const c=t.replace(/[\(\)\x1d]/g,'');if(/^\d{13}$/.test(c))return'JAN-13';if(/^\d{8}$/.test(c))return'JAN-8';return'その他';}
 
-let zxReady=false;
-const zxI=setInterval(()=>{if(typeof ZXing!=='undefined'){clearInterval(zxI);codeReader=new ZXing.BrowserMultiFormatReader();zxReady=true;setStatus('loading','準備完了');}},100);
-setTimeout(()=>{if(!zxReady){clearInterval(zxI);setStatus('off','読み込み失敗');}},8000);
+// ─── Wait for ZXing ───
+let zxReady = false;
+const zxI = setInterval(() => {
+  if (typeof ZXing !== 'undefined') {
+    clearInterval(zxI);
+    reader = new ZXing.MultiFormatReader();
+    zxReady = true;
+    setStatus('loading', '準備完了');
+  }
+}, 100);
+setTimeout(() => { if (!zxReady) { clearInterval(zxI); setStatus('off', '読み込み失敗'); } }, 8000);
 
-function setStatus(type,text){
-  const el=document.getElementById('cam-status');
-  el.querySelector('.cs-dot').className='cs-dot '+(type==='live'?'live':type==='loading'?'loading':'off');
-  el.querySelector('span').textContent=text;
+function setStatus(type, text) {
+  const el = document.getElementById('cam-status');
+  el.querySelector('.cs-dot').className = 'cs-dot ' + (type === 'live' ? 'live' : type === 'loading' ? 'loading' : 'off');
+  el.querySelector('span').textContent = text;
 }
 
-async function startScan(){
-  if(!zxReady){alert('ライブラリ読み込み中です。');return;}
-  document.getElementById('start-screen').classList.add('hidden');
-  document.getElementById('scan-overlay').style.display='flex';
-  document.getElementById('cam-hint').style.display='block';
-  setStatus('live','カメラ起動中...');
-  scanning=true;
+// ─── Camera Start ───
+async function startScan() {
+  if (!zxReady) { alert('ライブラリ読み込み中です。'); return; }
 
-  try{
-    // ── High-resolution camera with autofocus ──
+  document.getElementById('start-screen').classList.add('hidden');
+  document.getElementById('scan-overlay').style.display = 'flex';
+  document.getElementById('cam-hint').style.display = 'block';
+  setStatus('live', 'カメラ起動中...');
+
+  try {
+    // Step 1: Get high-resolution camera stream with autofocus
     const stream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: { ideal: 'environment' },
         width: { ideal: 1920 },
         height: { ideal: 1080 },
-        focusMode: { ideal: 'continuous' },
       }
     });
 
@@ -176,116 +180,129 @@ async function startScan(){
     video.srcObject = stream;
     await video.play();
 
-    // Apply advanced constraints for autofocus (if supported)
+    // Step 2: Try to enable continuous autofocus
     const track = stream.getVideoTracks()[0];
-    const caps = track.getCapabilities ? track.getCapabilities() : {};
-    const advConstraints = {};
+    try {
+      const caps = track.getCapabilities ? track.getCapabilities() : {};
+      if (caps.focusMode && caps.focusMode.includes('continuous')) {
+        await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+      }
+    } catch (e) { /* some devices don't support this */ }
 
-    if (caps.focusMode && caps.focusMode.includes('continuous')) {
-      advConstraints.focusMode = 'continuous';
-    }
-    // Some Android devices support torch — not needed but focusDistance helps
-    if (caps.focusDistance) {
-      // Don't set manual focus, let continuous autofocus handle it
-    }
-
-    if (Object.keys(advConstraints).length > 0) {
-      try { await track.applyConstraints({ advanced: [advConstraints] }); }
-      catch(e) { console.log('Advanced constraints not supported:', e); }
-    }
-
-    // Show actual resolution
+    // Show resolution info
     const settings = track.getSettings();
-    const resEl = document.getElementById('res-info');
-    resEl.textContent = (settings.width || '?') + '×' + (settings.height || '?');
-    resEl.classList.add('show');
+    const w = settings.width || '?';
+    const h = settings.height || '?';
+    setStatus('live', 'スキャン中 (' + w + '×' + h + ')');
 
-    setStatus('live', 'スキャン中... (' + (settings.width||'?') + '×' + (settings.height||'?') + ')');
+    scanning = true;
 
-    // ── Decode loop using zxing ──
-    const decodeLoop = () => {
-      if (!scanning) return;
+    // Step 3: Create canvas for frame capture
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+    // Step 4: Decode loop using setInterval + canvas capture
+    scanInterval = setInterval(() => {
+      if (!scanning || video.readyState < 2) return;
+
+      // Match canvas to video resolution
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
       try {
-        const result = codeReader.decodeFromVideoElement(video);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const luminance = new ZXing.RGBLuminanceSource(
+          new Uint8ClampedArray(imageData.data.buffer),
+          canvas.width, canvas.height
+        );
+        const bitmap = new ZXing.BinaryBitmap(
+          new ZXing.HybridBinarizer(luminance)
+        );
+
+        const result = reader.decode(bitmap);
         if (result) {
           const raw = result.getText();
           const now = Date.now();
           if (raw !== lastCode || now - lastTime >= 2000) {
-            lastCode = raw; lastTime = now;
+            lastCode = raw;
+            lastTime = now;
             if (navigator.vibrate) navigator.vibrate(100);
             handleScan(raw);
           }
         }
-      } catch(e) {
-        // NotFoundException is normal when no barcode in frame
+      } catch (e) {
+        // NotFoundException is expected when no barcode visible
       }
-      requestAnimationFrame(decodeLoop);
-    };
-    // Small delay to let camera warm up and autofocus
-    setTimeout(() => { requestAnimationFrame(decodeLoop); }, 500);
+    }, 200); // scan 5 times per second
 
-  } catch(e){
+  } catch (e) {
     if (e.name === 'NotAllowedError') {
-      setStatus('off','カメラが拒否されました');
-      alert('カメラへのアクセスを許可してください。\nブラウザの設定 → サイトの設定 → カメラ から許可できます。');
+      setStatus('off', 'カメラが拒否されました');
+      alert('カメラへのアクセスを許可してください。');
     } else if (e.name === 'NotFoundError') {
-      setStatus('off','カメラが見つかりません');
+      setStatus('off', 'カメラが見つかりません');
     } else {
-      setStatus('off','エラー: '+e.message);
+      setStatus('off', 'エラー: ' + e.message);
     }
   }
 }
 
-function stopScan(){
-  scanning=false;
-  const video=document.getElementById('video');
-  if(video.srcObject){video.srcObject.getTracks().forEach(t=>t.stop());video.srcObject=null;}
-  setStatus('off','停止中');
+function stopScan() {
+  scanning = false;
+  if (scanInterval) { clearInterval(scanInterval); scanInterval = null; }
+  const video = document.getElementById('video');
+  if (video.srcObject) { video.srcObject.getTracks().forEach(t => t.stop()); video.srcObject = null; }
+  setStatus('off', '停止中');
 }
 
-function handleScan(raw){
-  const parsed=parseGS1(raw),type=detectType(raw);
-  const entry={...parsed,barcodeType:type,timestamp:new Date()};
-  if(history.length>0&&history[0].raw===raw)return;
-  history.unshift(entry);if(history.length>50)history.pop();
-  document.getElementById('scan-count').textContent=history.length+'件';
+// ─── Handle Scan ───
+function handleScan(raw) {
+  const parsed = parseGS1(raw), type = detectType(raw);
+  const entry = { ...parsed, barcodeType: type, timestamp: new Date() };
+  if (history.length > 0 && history[0].raw === raw) return;
+  history.unshift(entry); if (history.length > 50) history.pop();
+  document.getElementById('scan-count').textContent = history.length + '件';
   document.getElementById('history-btn').classList.add('show');
   showResult(entry);
 }
 
-function showResult(r){
-  const content=document.getElementById('result-content');
-  let f='';
-  const add=(l,v,h)=>{const c=v?(h?'field-value highlight':'field-value'):'field-value empty';f+=`<div class="field"><div class="field-label">${l}</div><div class="${c}">${v||'なし'}</div></div>`;};
-  add('商品コード (GTIN)',r.gtin,false);
-  add('有効期限',r.expiryDate?.formatted,true);
-  add('ロット番号',r.lotNumber,false);
-  if(r.serialNumber)add('シリアル番号',r.serialNumber,false);
+// ─── Result Display ───
+function showResult(r) {
+  const content = document.getElementById('result-content');
+  let f = '';
+  const add = (l, v, h) => { const c = v ? (h ? 'field-value highlight' : 'field-value') : 'field-value empty'; f += `<div class="field"><div class="field-label">${l}</div><div class="${c}">${v || 'なし'}</div></div>`; };
+  add('商品コード (GTIN)', r.gtin, false);
+  add('有効期限', r.expiryDate?.formatted, true);
+  add('ロット番号', r.lotNumber, false);
+  if (r.serialNumber) add('シリアル番号', r.serialNumber, false);
 
-  let tok='';
-  const m=r.raw.match(/\(\d{2,4}\)[^\(]*/g);
-  if(m){
-    const cs={'01':{bg:'#dbeafe',bd:'#3b82f6',tx:'#1e40af'},'17':{bg:'#dcfce7',bd:'#22c55e',tx:'#166534'},'10':{bg:'#fef3c7',bd:'#f59e0b',tx:'#92400e'},'21':{bg:'#f3e8ff',bd:'#a855f7',tx:'#6b21a8'}};
-    tok='<div class="tokens">';
-    m.forEach(s=>{const x=s.match(/\((\d{2,4})\)(.*)/);if(!x)return;const c=cs[x[1]]||{bg:'#f1f5f9',bd:'#94a3b8',tx:'#475569'};tok+=`<div class="tok" style="background:${c.bg};border-color:${c.bd}"><span class="tok-ai" style="color:${c.tx}">AI(${x[1]})</span><span class="tok-val" style="color:${c.tx}">${x[2]}</span></div>`;});
-    tok+='</div>';
+  let tok = '';
+  const m = r.raw.match(/\(\d{2,4}\)[^\(]*/g);
+  if (m) {
+    const cs = { '01': { bg: '#dbeafe', bd: '#3b82f6', tx: '#1e40af' }, '17': { bg: '#dcfce7', bd: '#22c55e', tx: '#166534' }, '10': { bg: '#fef3c7', bd: '#f59e0b', tx: '#92400e' }, '21': { bg: '#f3e8ff', bd: '#a855f7', tx: '#6b21a8' } };
+    tok = '<div class="tokens">';
+    m.forEach(s => { const x = s.match(/\((\d{2,4})\)(.*)/); if (!x) return; const c = cs[x[1]] || { bg: '#f1f5f9', bd: '#94a3b8', tx: '#475569' }; tok += `<div class="tok" style="background:${c.bg};border-color:${c.bd}"><span class="tok-ai" style="color:${c.tx}">AI(${x[1]})</span><span class="tok-val" style="color:${c.tx}">${x[2]}</span></div>`; });
+    tok += '</div>';
   }
 
-  content.innerHTML=`<div class="result-header"><div class="result-dot"></div><span class="result-title">検出</span><span class="result-type">${r.barcodeType}</span></div><div class="fields">${f}</div><div class="raw-row"><code>${r.raw}</code><button onclick="navigator.clipboard?.writeText('${r.raw}')">コピー</button></div>${tok}`;
+  const escaped = r.raw.replace(/'/g, "\\'");
+  content.innerHTML = `<div class="result-header"><div class="result-dot"></div><span class="result-title">検出</span><span class="result-type">${r.barcodeType}</span></div><div class="fields">${f}</div><div class="raw-row"><code>${r.raw}</code><button onclick="navigator.clipboard?.writeText('${escaped}')">コピー</button></div>${tok}`;
   document.getElementById('result-panel').classList.add('show');
 }
 
-function dismissResult(){document.getElementById('result-panel').classList.remove('show');}
+function dismissResult() { document.getElementById('result-panel').classList.remove('show'); }
 
-function openHistory(){
-  const d=document.getElementById('history-drawer'),l=document.getElementById('hd-list'),c=document.getElementById('hd-clear');
-  if(history.length===0){l.innerHTML='<div class="hd-empty">まだスキャン履歴がありません</div>';c.style.display='none';}
-  else{l.innerHTML=history.map((h,i)=>`<div class="hd-item" onclick="showHI(${i})"><div class="hd-time">${h.timestamp.toLocaleTimeString('ja-JP')} — ${h.barcodeType}</div><div class="hd-code">${h.raw}</div><div class="hd-info">${h.gtin?'GTIN:'+h.gtin:''} ${h.expiryDate?'期限:'+h.expiryDate.formatted:''} ${h.lotNumber?'ロット:'+h.lotNumber:''}</div></div>`).join('');c.style.display='block';}
+// ─── History ───
+function openHistory() {
+  const d = document.getElementById('history-drawer'), l = document.getElementById('hd-list'), c = document.getElementById('hd-clear');
+  if (history.length === 0) { l.innerHTML = '<div class="hd-empty">まだスキャン履歴がありません</div>'; c.style.display = 'none'; }
+  else { l.innerHTML = history.map((h, i) => `<div class="hd-item" onclick="showHI(${i})"><div class="hd-time">${h.timestamp.toLocaleTimeString('ja-JP')} — ${h.barcodeType}</div><div class="hd-code">${h.raw}</div><div class="hd-info">${h.gtin ? 'GTIN:' + h.gtin : ''} ${h.expiryDate ? '期限:' + h.expiryDate.formatted : ''} ${h.lotNumber ? 'ロット:' + h.lotNumber : ''}</div></div>`).join(''); c.style.display = 'block'; }
   d.classList.add('open');
 }
-function closeHistory(){document.getElementById('history-drawer').classList.remove('open');}
-function showHI(i){closeHistory();showResult(history[i]);}
-function clearHistory(){history=[];document.getElementById('scan-count').textContent='0件';document.getElementById('history-btn').classList.remove('show');closeHistory();dismissResult();}
+function closeHistory() { document.getElementById('history-drawer').classList.remove('open'); }
+function showHI(i) { closeHistory(); showResult(history[i]); }
+function clearHistory() { history = []; document.getElementById('scan-count').textContent = '0件'; document.getElementById('history-btn').classList.remove('show'); closeHistory(); dismissResult(); }
 </script>
 </body>
 </html>
