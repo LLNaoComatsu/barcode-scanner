@@ -33,6 +33,15 @@
   .cs-dot.off{background:#94a3b8}
   .cs-dot.loading{background:#fbbf24;animation:blink .6s infinite}
   @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+
+  /* Focus slider */
+  .focus-control{position:absolute;right:12px;top:50%;transform:translateY(-50%);z-index:8;display:none;flex-direction:column;align-items:center;gap:4px;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);padding:8px 6px;border-radius:12px}
+  .focus-control.show{display:flex}
+  .focus-control label{font-size:9px;color:#94a3b8;writing-mode:vertical-rl;letter-spacing:1px}
+  .focus-slider{-webkit-appearance:none;appearance:none;width:140px;height:4px;background:rgba(255,255,255,0.2);border-radius:2px;outline:none;transform:rotate(-90deg);transform-origin:center center}
+  .focus-slider::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;background:#34d399;cursor:pointer;border:2px solid #fff;box-shadow:0 0 8px rgba(52,211,153,0.5)}
+  .focus-val{font-size:10px;color:#34d399;font-family:monospace;font-weight:600}
+
   .start-screen{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;background:#0f172a;z-index:5}
   .start-screen svg{opacity:.4}
   .start-screen p{color:#94a3b8;font-size:14px;text-align:center;padding:0 32px;line-height:1.6}
@@ -97,6 +106,15 @@
   <div class="camera-status" id="cam-status"><div class="cs-dot loading"></div><span>準備中...</span></div>
   <div class="camera-hint" id="cam-hint" style="display:none;">バーコードをカメラにかざしてください</div>
   <div class="debug-info" id="debug-info">...</div>
+
+  <!-- Focus distance slider (shown only when manual focus is needed) -->
+  <div class="focus-control" id="focus-control">
+    <label>近</label>
+    <input type="range" class="focus-slider" id="focus-slider" min="0" max="100" value="35">
+    <label>遠</label>
+    <div class="focus-val" id="focus-val">--</div>
+  </div>
+
   <button class="history-btn" id="history-btn" onclick="openHistory()">📋 履歴</button>
 
   <div class="start-screen" id="start-screen">
@@ -128,6 +146,8 @@
 let scanning = false, historyList = [];
 let lastCode = '', lastTime = 0;
 let codeReader = null, currentStream = null;
+let activeTrack = null;
+let focusMin = 0, focusMax = 1;
 
 function parseGS1(raw) {
   const r = { raw, gtin:null, expiryDate:null, lotNumber:null, serialNumber:null };
@@ -190,6 +210,20 @@ function setStatus(type, text) {
 }
 function dbg(text) { document.getElementById('debug-info').textContent = text; }
 
+// ── Focus slider handler ──
+document.getElementById('focus-slider').addEventListener('input', async (e) => {
+  if (!activeTrack) return;
+  const pct = parseInt(e.target.value) / 100;
+  const dist = focusMin + (focusMax - focusMin) * pct;
+  try {
+    await activeTrack.applyConstraints({ advanced: [{ focusMode: 'manual', focusDistance: dist }] });
+    const cm = dist > 0 ? Math.round(100 / dist) : '∞';
+    document.getElementById('focus-val').textContent = dist.toFixed(3) + ' (' + cm + 'cm)';
+  } catch (e) {
+    document.getElementById('focus-val').textContent = 'err';
+  }
+});
+
 async function startScan() {
   if (!zxReady) { alert('ライブラリ読み込み中です。'); return; }
 
@@ -199,7 +233,7 @@ async function startScan() {
   setStatus('live', 'カメラ起動中...');
 
   try {
-    // ── Attempt 1: Request with focusMode in initial constraints ──
+    // Get stream
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
@@ -208,27 +242,15 @@ async function startScan() {
           facingMode: { exact: 'environment' },
           width: { ideal: 1920 },
           height: { ideal: 1080 },
-          focusMode: { ideal: 'continuous' },
         }
       });
     } catch (e1) {
-      // ── Attempt 2: Without focusMode, without exact facingMode ──
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: false,
-          video: {
-            facingMode: { ideal: 'environment' },
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
-          }
-        });
-      } catch (e2) {
-        // ── Attempt 3: Minimal ──
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: false,
-          video: { facingMode: 'environment' }
-        });
-      }
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+      }).catch(() =>
+        navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: 'environment' } })
+      );
     }
 
     currentStream = stream;
@@ -237,7 +259,6 @@ async function startScan() {
     video.setAttribute('playsinline', '');
     await video.play();
 
-    // Wait for video to be ready
     await new Promise(resolve => {
       const check = () => {
         if (video.videoWidth > 0 && video.videoHeight > 0) resolve();
@@ -245,77 +266,71 @@ async function startScan() {
       };
       check();
     });
-
     video.width = video.videoWidth;
     video.height = video.videoHeight;
 
-    // ── Aggressively try to enable autofocus via applyConstraints ──
+    // ── Focus handling ──
     const track = stream.getVideoTracks()[0];
-    let afStatus = 'unknown';
+    activeTrack = track;
+    let afStatus = 'none';
     let capsInfo = '';
 
     try {
       const caps = track.getCapabilities ? track.getCapabilities() : {};
       const focusModes = caps.focusMode || [];
-      const hasContinuous = focusModes.includes('continuous');
-      const hasSingleShot = focusModes.includes('single-shot');
-      const focusDistRange = caps.focusDistance || null;
+      const focusDist = caps.focusDistance || null;
       capsInfo = 'modes:[' + focusModes.join(',') + ']';
-      if (focusDistRange) capsInfo += ' dist:' + focusDistRange.min + '-' + focusDistRange.max;
 
-      // Try continuous first
-      if (hasContinuous) {
+      if (focusDist) {
+        focusMin = focusDist.min;
+        focusMax = focusDist.max;
+        capsInfo += ' dist:' + focusMin.toFixed(3) + '-' + focusMax.toFixed(3);
+
+        // focusDistance is in diopters (1/meters)
+        // For barcode scanning at ~20-30cm, we need diopter ≈ 3.3-5.0
+        // But the max is 0.786 diopter = ~1.27m minimum focus distance
+        // So we set to MAX value (closest possible focus)
+        const nearestFocus = focusMax;
+
+        try {
+          await track.applyConstraints({
+            advanced: [{ focusMode: 'manual', focusDistance: nearestFocus }]
+          });
+          const s = track.getSettings();
+          afStatus = 'manual@' + (s.focusDistance !== undefined ? s.focusDistance.toFixed(3) : nearestFocus.toFixed(3));
+          
+          // Update slider to match
+          const pct = ((nearestFocus - focusMin) / (focusMax - focusMin)) * 100;
+          document.getElementById('focus-slider').value = pct;
+          const cm = nearestFocus > 0 ? Math.round(100 / nearestFocus) : '∞';
+          document.getElementById('focus-val').textContent = nearestFocus.toFixed(3) + ' (' + cm + 'cm)';
+        } catch (e) {
+          afStatus = 'manual-set-failed';
+        }
+
+        // Show focus slider for manual adjustment
+        document.getElementById('focus-control').classList.add('show');
+
+      } else if (focusModes.includes('continuous')) {
         try {
           await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
           afStatus = 'continuous';
-        } catch (e) {
-          afStatus = 'continuous-failed';
-        }
-      }
-
-      // If continuous didn't work, try single-shot (tap-to-focus equivalent)
-      if (afStatus !== 'continuous' && hasSingleShot) {
-        try {
-          await track.applyConstraints({ advanced: [{ focusMode: 'single-shot' }] });
-          afStatus = 'single-shot';
-          // Re-trigger single-shot periodically
-          setInterval(async () => {
-            if (!scanning) return;
-            try { await track.applyConstraints({ advanced: [{ focusMode: 'single-shot' }] }); }
-            catch(e) {}
-          }, 3000);
-        } catch (e) {
-          afStatus = 'single-shot-failed';
-        }
-      }
-
-      // If neither worked but we have focusDistance, set to near range
-      if (afStatus.includes('failed') || afStatus === 'unknown') {
-        if (focusDistRange) {
-          try {
-            // Set focus to near range (good for barcode scanning ~15-30cm)
-            const nearFocus = focusDistRange.min + (focusDistRange.max - focusDistRange.min) * 0.15;
-            await track.applyConstraints({ advanced: [{ focusDistance: nearFocus }] });
-            afStatus = 'manual(' + nearFocus.toFixed(2) + ')';
-          } catch (e) {
-            afStatus = 'manual-failed';
-          }
-        }
+        } catch (e) { afStatus = 'continuous-failed'; }
       }
     } catch (e) {
-      afStatus = 'caps-error';
+      afStatus = 'caps-error:' + e.message;
     }
 
-    // Read final settings
-    const settings = track.getSettings();
-    const finalAF = settings.focusMode || afStatus;
     const vw = video.videoWidth;
     const vh = video.videoHeight;
+    const finalSettings = track.getSettings();
+    const finalFocus = finalSettings.focusDistance !== undefined ? finalSettings.focusDistance.toFixed(3) : '?';
+    const finalMode = finalSettings.focusMode || '?';
 
-    dbg(vw + '×' + vh + ' | AF:' + finalAF + ' | ' + capsInfo);
+    dbg(vw + '×' + vh + ' | focus:' + finalMode + '@' + finalFocus + ' | ' + capsInfo);
     setStatus('live', 'スキャン中 (' + vw + '×' + vh + ')');
 
-    // ── Start decode ──
+    // Start decode
     scanning = true;
     codeReader.decodeFromStream(currentStream, video, (result, err) => {
       if (result) {
@@ -345,6 +360,7 @@ function stopScan() {
   scanning = false;
   if (codeReader) codeReader.reset();
   if (currentStream) { currentStream.getTracks().forEach(t => t.stop()); currentStream = null; }
+  activeTrack = null;
   setStatus('off', '停止中');
 }
 
