@@ -16,7 +16,14 @@
   .header .sub{font-size:10px;color:rgba(255,255,255,0.6)}
   .scan-count{margin-left:auto;padding:4px 10px;background:rgba(255,255,255,0.15);border-radius:12px;font-size:11px;font-weight:600}
   .camera-section{flex:1;position:relative;overflow:hidden;background:#000;min-height:0}
-  #video{width:100%;height:100%;object-fit:cover;display:block}
+  /* Key fix: video is sized larger than viewport, clipped by overflow:hidden */
+  #video{
+    position:absolute;
+    top:50%;left:50%;
+    transform:translate(-50%,-50%);
+    min-width:100%;min-height:100%;
+    /* width/height attributes will be set via JS to match actual camera resolution */
+  }
   .scan-overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
   .scan-frame{width:75%;max-width:320px;aspect-ratio:3/2;position:relative}
   .sf-corner{position:absolute;width:24px;height:24px}
@@ -125,7 +132,7 @@
 
 <script src="https://unpkg.com/@zxing/library@latest"></script>
 <script>
-let scanning = false, history = [];
+let scanning = false, historyList = [];
 let lastCode = '', lastTime = 0;
 let codeReader = null;
 let currentStream = null;
@@ -162,7 +169,6 @@ function parseGS1(raw) {
   }
   return r;
 }
-
 function detectType(t) {
   if (!t) return '不明';
   if (t.includes('(01)') || t.match(/^01\d{14}/)) return 'GS1';
@@ -178,13 +184,12 @@ const zxI = setInterval(() => {
   if (typeof ZXing !== 'undefined') {
     clearInterval(zxI);
     codeReader = new ZXing.BrowserMultiFormatReader();
-    // Set TRY_HARDER hints
     const hints = new Map();
     hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
     codeReader.hints = hints;
     zxReady = true;
     setStatus('loading', '準備完了');
-    debug('zxing-js loaded');
+    dbg('zxing-js loaded');
   }
 }, 100);
 setTimeout(() => { if (!zxReady) { clearInterval(zxI); setStatus('off', '読み込み失敗'); } }, 10000);
@@ -194,9 +199,7 @@ function setStatus(type, text) {
   el.querySelector('.cs-dot').className = 'cs-dot ' + (type === 'live' ? 'live' : type === 'loading' ? 'loading' : 'off');
   el.querySelector('span').textContent = text;
 }
-function debug(text) {
-  document.getElementById('debug-info').textContent = text;
-}
+function dbg(text) { document.getElementById('debug-info').textContent = text; }
 
 // ─── Camera Start ───
 async function startScan() {
@@ -208,45 +211,57 @@ async function startScan() {
   setStatus('live', 'カメラ起動中...');
 
   try {
-    // ── Step 1: Get high-res camera stream manually ──
-    const constraints = {
+    // Step 1: Get high-res stream
+    currentStream = await navigator.mediaDevices.getUserMedia({
       audio: false,
       video: {
         facingMode: { ideal: 'environment' },
         width: { ideal: 1920 },
         height: { ideal: 1080 },
       }
-    };
+    }).catch(() =>
+      navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: 'environment' } })
+    );
 
-    currentStream = await navigator.mediaDevices.getUserMedia(constraints).catch(() => {
-      // Fallback
-      return navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: 'environment' } });
-    });
-
-    // ── Step 2: Attach stream to video manually ──
+    // Step 2: Set video element attributes to match actual resolution
     const video = document.getElementById('video');
     video.srcObject = currentStream;
     video.setAttribute('playsinline', '');
     await video.play();
 
-    // ── Step 3: Enable autofocus ──
+    // Wait for video dimensions to be available
+    await new Promise(resolve => {
+      const check = () => {
+        if (video.videoWidth > 0 && video.videoHeight > 0) resolve();
+        else requestAnimationFrame(check);
+      };
+      check();
+    });
+
+    // KEY FIX: Set the video element's width/height attributes
+    // to the actual camera resolution. This forces zxing-js internal
+    // canvas to use the full resolution instead of CSS display size.
+    video.width = video.videoWidth;
+    video.height = video.videoHeight;
+
+    // Step 3: Autofocus
     const track = currentStream.getVideoTracks()[0];
+    let af = 'default';
     try {
       const caps = track.getCapabilities ? track.getCapabilities() : {};
       if (caps.focusMode && caps.focusMode.includes('continuous')) {
         await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+        af = 'continuous';
       }
-    } catch (e) { /* not supported */ }
+    } catch (e) {}
 
-    const settings = track.getSettings();
-    const w = settings.width || video.videoWidth || '?';
-    const h = settings.height || video.videoHeight || '?';
-    const af = settings.focusMode || 'default';
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    dbg('video:' + vw + '×' + vh + ' attr:' + video.width + '×' + video.height + ' AF:' + af);
+    setStatus('live', 'スキャン中 (' + vw + '×' + vh + ')');
 
-    // ── Step 4: Use BrowserMultiFormatReader.decodeFromStream ──
-    // This method handles canvas internally with proper pixel format
+    // Step 4: Decode from stream
     scanning = true;
-
     codeReader.decodeFromStream(currentStream, video, (result, err) => {
       if (result) {
         const raw = result.getText();
@@ -258,22 +273,13 @@ async function startScan() {
           handleScan(raw);
         }
       }
-      // Update debug with stream info on first frame
-      if (scanning) {
-        const vw = video.videoWidth || '?';
-        const vh = video.videoHeight || '?';
-        debug(vw + '×' + vh + ' | AF:' + af + ' | decode:active');
-        setStatus('live', 'スキャン中 (' + vw + '×' + vh + ')');
-      }
     });
 
   } catch (e) {
-    debug('Error: ' + e.name + ' ' + e.message);
+    dbg('Error: ' + e.name + ' ' + e.message);
     if (e.name === 'NotAllowedError') {
       setStatus('off', 'カメラが拒否されました');
       alert('カメラへのアクセスを許可してください。');
-    } else if (e.name === 'NotFoundError') {
-      setStatus('off', 'カメラが見つかりません');
     } else {
       setStatus('off', 'エラー: ' + e.message);
     }
@@ -291,9 +297,9 @@ function stopScan() {
 function handleScan(raw) {
   const parsed = parseGS1(raw), type = detectType(raw);
   const entry = { ...parsed, barcodeType: type, timestamp: new Date() };
-  if (history.length > 0 && history[0].raw === raw) return;
-  history.unshift(entry); if (history.length > 50) history.pop();
-  document.getElementById('scan-count').textContent = history.length + '件';
+  if (historyList.length > 0 && historyList[0].raw === raw) return;
+  historyList.unshift(entry); if (historyList.length > 50) historyList.pop();
+  document.getElementById('scan-count').textContent = historyList.length + '件';
   document.getElementById('history-btn').classList.add('show');
   showResult(entry);
 }
@@ -324,22 +330,21 @@ function showResult(r) {
   content.innerHTML = `<div class="result-header"><div class="result-dot"></div><span class="result-title">検出</span><span class="result-type">${r.barcodeType}</span></div><div class="fields">${f}</div><div class="raw-row"><code>${r.raw}</code><button onclick="navigator.clipboard?.writeText('${escaped}')">コピー</button></div>${tok}`;
   document.getElementById('result-panel').classList.add('show');
 }
-
 function dismissResult() { document.getElementById('result-panel').classList.remove('show'); }
 
 // ─── History ───
 function openHistory() {
   const d = document.getElementById('history-drawer'), l = document.getElementById('hd-list'), c = document.getElementById('hd-clear');
-  if (history.length === 0) { l.innerHTML = '<div class="hd-empty">まだスキャン履歴がありません</div>'; c.style.display = 'none'; }
+  if (historyList.length === 0) { l.innerHTML = '<div class="hd-empty">まだスキャン履歴がありません</div>'; c.style.display = 'none'; }
   else {
-    l.innerHTML = history.map((h, i) => `<div class="hd-item" onclick="showHI(${i})"><div class="hd-time">${h.timestamp.toLocaleTimeString('ja-JP')} — ${h.barcodeType}</div><div class="hd-code">${h.raw}</div><div class="hd-info">${h.gtin ? 'GTIN:'+h.gtin : ''} ${h.expiryDate ? '期限:'+h.expiryDate.formatted : ''} ${h.lotNumber ? 'ロット:'+h.lotNumber : ''}</div></div>`).join('');
+    l.innerHTML = historyList.map((h, i) => `<div class="hd-item" onclick="showHI(${i})"><div class="hd-time">${h.timestamp.toLocaleTimeString('ja-JP')} — ${h.barcodeType}</div><div class="hd-code">${h.raw}</div><div class="hd-info">${h.gtin ? 'GTIN:'+h.gtin : ''} ${h.expiryDate ? '期限:'+h.expiryDate.formatted : ''} ${h.lotNumber ? 'ロット:'+h.lotNumber : ''}</div></div>`).join('');
     c.style.display = 'block';
   }
   d.classList.add('open');
 }
 function closeHistory() { document.getElementById('history-drawer').classList.remove('open'); }
-function showHI(i) { closeHistory(); showResult(history[i]); }
-function clearHistory() { history = []; document.getElementById('scan-count').textContent = '0件'; document.getElementById('history-btn').classList.remove('show'); closeHistory(); dismissResult(); }
+function showHI(i) { closeHistory(); showResult(historyList[i]); }
+function clearHistory() { historyList = []; document.getElementById('scan-count').textContent = '0件'; document.getElementById('history-btn').classList.remove('show'); closeHistory(); dismissResult(); }
 </script>
 </body>
 </html>
